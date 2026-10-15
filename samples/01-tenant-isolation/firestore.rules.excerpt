@@ -1,0 +1,200 @@
+// Shabakti — excerpt of firestore.rules (first part only; the full file covers about 30 collections).
+// Shows tenant membership via user_tenant_index and role-based permission checks inside each tenant.
+// Some inline comments are in Arabic.
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── عام (خارج الشبكة) ───
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userIndexPath() {
+      return /databases/$(database)/documents/user_tenant_index/$(request.auth.uid);
+    }
+
+    function hasTenantIndex() {
+      return signedIn() && exists(userIndexPath());
+    }
+
+    function hasValidTenantIndex() {
+      return hasTenantIndex()
+        && get(userIndexPath()).data.tenantId is string
+        && get(userIndexPath()).data.tenantId.size() > 0;
+    }
+
+    function userTenantId() {
+      return get(userIndexPath()).data.tenantId;
+    }
+
+    function isMember(tenantId) {
+      return hasValidTenantIndex() && userTenantId() == tenantId;
+    }
+
+    function isBootstrapping() {
+      return signedIn() && !hasValidTenantIndex();
+    }
+
+    function selfTenantUserPath(tenantId) {
+      return /databases/$(database)/documents/tenants/$(tenantId)/users/$(request.auth.uid);
+    }
+
+    function hasSelfTenantUser(tenantId) {
+      return signedIn() && exists(selfTenantUserPath(tenantId));
+    }
+
+    function callerUserData(tenantId) {
+      return get(/databases/$(database)/documents/tenants/$(tenantId)/users/$(request.auth.uid)).data;
+    }
+
+    function callerHasPerm(tenantId, perm) {
+      let u = callerUserData(tenantId);
+      let roleId = u.roleId;
+      let r = get(/databases/$(database)/documents/tenants/$(tenantId)/roles/$(roleId)).data;
+      let perms = r.permissions;
+      return (perms is list && perms.hasAny([perm]))
+        || (perms is map && (perm in perms));
+    }
+
+    match /platform_admins/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if false;
+    }
+
+    match /user_tenant_index/{uid} {
+      allow read: if signedIn() && (
+        request.auth.uid == uid
+        || (hasTenantIndex() && callerHasPerm(userTenantId(), "USERS_VIEW"))
+      );
+      // مالك شبكة جديدة يربط نفسه، أو مدير يضيف موظفاً، أو موظف يربط نفسه بسجل موجود.
+      allow create: if signedIn() && (
+        (
+          request.auth.uid == uid
+          && isBootstrapping()
+          && request.resource.data.tenantId is string
+          && request.resource.data.tenantId.size() > 0
+        )
+        || (
+          request.auth.uid == uid
+          && request.resource.data.tenantId is string
+          && request.resource.data.tenantId.size() > 0
+          && exists(
+            /databases/$(database)/documents/tenants/$(request.resource.data.tenantId)/users/$(request.auth.uid)
+          )
+        )
+        || (
+          hasTenantIndex()
+          && request.auth.uid != uid
+          && request.resource.data.tenantId == userTenantId()
+          && callerHasPerm(userTenantId(), "USERS_ADD")
+        )
+      );
+      allow update: if signedIn() && (
+        (
+          request.auth.uid == uid
+          && isBootstrapping()
+          && request.resource.data.tenantId is string
+          && request.resource.data.tenantId.size() > 0
+        )
+        || (
+          request.auth.uid == uid
+          && request.resource.data.tenantId is string
+          && request.resource.data.tenantId.size() > 0
+          && exists(
+            /databases/$(database)/documents/tenants/$(request.resource.data.tenantId)/users/$(request.auth.uid)
+          )
+        )
+        || (
+          hasTenantIndex()
+          && request.auth.uid != uid
+          && request.resource.data.tenantId == userTenantId()
+          && callerHasPerm(userTenantId(), "USERS_ADD")
+        )
+      );
+      allow delete: if signedIn() && request.auth.uid == uid && (
+        !hasValidTenantIndex()
+        || !exists(
+          /databases/$(database)/documents/tenants/$(userTenantId())/users/$(request.auth.uid)
+        )
+      );
+    }
+
+    match /tenants/{tenantId} {
+
+      allow read: if signedIn() && (
+        isMember(tenantId)
+        || resource.data.ownerId == request.auth.uid
+        || hasSelfTenantUser(tenantId)
+      );
+      allow create: if signedIn()
+        && isBootstrapping()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.status == 'active';
+      allow update: if signedIn() && isMember(tenantId);
+      allow delete: if false;
+
+      // ─── دوال الصلاحيات داخل الشبكة ───
+
+      function tenantUserPath() {
+        return /databases/$(database)/documents/tenants/$(tenantId)/users/$(request.auth.uid);
+      }
+
+      function userDoc() {
+        return signedIn() && exists(tenantUserPath())
+          ? get(tenantUserPath()).data
+          : null;
+      }
+
+      function roleDoc() {
+        let u = userDoc();
+        return (u != null && u.roleId != null)
+          ? get(/databases/$(database)/documents/tenants/$(tenantId)/roles/$(u.roleId)).data
+          : null;
+      }
+
+      function rolePerms() {
+        let r = roleDoc();
+        return (r != null && r.permissions != null) ? r.permissions : [];
+      }
+
+      function hasPerm(p) {
+        let perms = rolePerms();
+        return signedIn() && isMember(tenantId) && (
+          (perms is list && perms.hasAny([p])) ||
+          (perms is map && (p in perms))
+        );
+      }
+
+      function myAreaId() {
+        let u = userDoc();
+        return (u != null && u.areaId != null && u.areaId != "") ? u.areaId : null;
+      }
+
+      function targetUserInCallerAreas() {
+        let targetArea = resource.data.areaId;
+        let u = userDoc();
+        let callerAreas = u != null ? u.areaIds : null;
+        return targetArea != null
+          && targetArea != ""
+          && u != null
+          && (
+            (callerAreas is list && callerAreas.size() > 0 && callerAreas.hasAny([targetArea]))
+            || (myAreaId() != null && targetArea == myAreaId())
+          );
+      }
+
+      function canWriteSummariesOnBatch() {
+        return hasPerm("SUMMARIES_WRITE")
+          || hasPerm("CARD_BATCH_PAY")
+          || hasPerm("CARD_BATCH_ADD")
+          || hasPerm("CARD_BATCH_EDIT")
+          || hasPerm("CARD_BATCH_CONFIRM");
+      }
+
+      // ... per-collection rules continue (users, roles, areas, card_batches, payments, expenses, tasks, inventory, ...)
+    }
+  }
+}
